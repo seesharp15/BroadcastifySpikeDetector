@@ -1,0 +1,193 @@
+:root{
+  --bg:#0b1020;
+  --panel:#0f1833;
+  --card:#101b3b;
+  --text:#e7ecff;
+  --muted:#9aa7d1;
+  --border:rgba(255,255,255,.10);
+  --accent:#6ea8fe;
+  --good:#22c55e;
+  --warn:#f59e0b;
+  --bad:#ef4444;
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+  background: radial-gradient(1000px 700px at 10% -20%, rgba(110,168,254,.35), transparent 60%),
+              radial-gradient(900px 600px at 90% 0%, rgba(34,197,94,.20), transparent 55%),
+              var(--bg);
+  color:var(--text);
+}
+
+.topbar{
+  position:sticky; top:0;
+  backdrop-filter: blur(10px);
+  background: rgba(11,16,32,.70);
+  border-bottom:1px solid var(--border);
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:14px 18px;
+  z-index:10;
+}
+
+.brand{display:flex; gap:12px; align-items:center}
+.logo{
+  width:40px; height:40px;
+  border-radius:12px;
+  display:grid; place-items:center;
+  background: linear-gradient(135deg, rgba(110,168,254,.9), rgba(34,197,94,.75));
+  color:#08102a;
+  font-weight:900;
+}
+.title{font-size:16px; font-weight:800; letter-spacing:.2px}
+.subtitle{font-size:12px; color:var(--muted)}
+
+.status{display:flex; gap:10px; align-items:center}
+.chip{
+  padding:7px 10px;
+  border:1px solid var(--border);
+  border-radius:999px;
+  background: rgba(255,255,255,.04);
+  font-size:12px;
+  color:var(--text);
+}
+.chip-good{border-color:rgba(34,197,94,.35); color:#b8f7cd}
+.chip-bad{border-color:rgba(239,68,68,.35); color:#ffd0d0}
+.chip-muted{color:var(--muted)}
+
+.wrap{max-width:1200px; margin:0 auto; padding:18px}
+.cards{
+  display:grid;
+  grid-template-columns: repeat(3, minmax(0,1fr));
+  gap:12px;
+  margin-bottom:12px;
+}
+@media (max-width: 900px){
+  .cards{grid-template-columns:1fr}
+}
+
+.card{
+  background: rgba(16,27,59,.70);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:14px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+}
+.card-title{color:var(--muted); font-size:12px; letter-spacing:.2px}
+.metric{font-size:26px; font-weight:900; margin-top:6px}
+.hint{color:var(--muted); font-size:12px; margin-top:4px}
+
+.panel{
+  background: rgba(15,24,51,.75);
+  border:1px solid var(--border);
+  border-radius:16px;
+  overflow:hidden;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+}
+
+.tabs{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  padding:10px;
+  border-bottom:1px solid var(--border);
+}
+.tab{
+  appearance:none;
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.03);
+  color:var(--text);
+  padding:8px 10px;
+  border-radius:12px;
+  cursor:pointer;
+  font-weight:700;
+  font-size:12px;
+}
+.tab.active{
+  border-color: rgba(110,168,254,.45);
+  background: rgba(110,168,254,.12);
+}
+.tab-spacer{flex:1}
+
+.search{
+  width:340px;
+  max-width:45vw;
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.03);
+  color:var(--text);
+  padding:9px 10px;
+  border-radius:12px;
+  outline:none;
+}
+.btn{
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.04);
+  color:var(--text);
+  padding:9px 12px;
+  border-radius:12px;
+  cursor:pointer;
+  font-weight:800;
+}
+
+.tabbody{display:none; padding:10px}
+.tabbody.active{display:block}
+
+.tablewrap{
+  max-height: 62vh;
+  overflow:auto;
+  border:1px solid var(--border);
+  border-radius:14px;
+}
+
+.grid{
+  width:100%;
+  border-collapse:separate;
+  border-spacing:0;
+  font-size:13px;
+}
+.grid thead th{
+  position:sticky; top:0;
+  background: rgba(12,18,40,.92);
+  border-bottom:1px solid var(--border);
+  text-align:left;
+  padding:10px;
+  color:var(--muted);
+  font-weight:800;
+}
+.grid tbody td{
+  padding:10px;
+  border-bottom:1px solid rgba(255,255,255,.06);
+  vertical-align:top;
+}
+.grid tbody tr:hover{
+  background: rgba(255,255,255,.03);
+}
+.right{text-align:right}
+
+a.link{
+  color: var(--accent);
+  text-decoration:none;
+  font-weight:800;
+}
+a.link:hover{text-decoration:underline}
+
+.badge{
+  display:inline-block;
+  padding:4px 8px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background: rgba(255,255,255,.04);
+  font-size:12px;
+  font-weight:800;
+}
+.badge-spike{border-color:rgba(245,158,11,.35); color:#ffe7bb}
+.badge-new{border-color:rgba(110,168,254,.35); color:#d8e7ff}
+
+.empty{
+  padding:18px;
+  color:var(--muted);
+}

@@ -1,141 +1,227 @@
 ﻿using BroadcastifySpikes.Core;
 using HtmlAgilityPack;
+using Npgsql;
 using StackExchange.Redis;
-using System.Net.Http.Headers;
 
-var cfg = AppConfig.FromEnvironment();
-Console.WriteLine($"[ingestor] starting. db={cfg.Db.Host}:{cfg.Db.Port}/{cfg.Db.Database} redis={cfg.Redis.Host}:{cfg.Redis.Port}");
+namespace BroadcastifySpikes.Ingestor;
 
-var store = new PostgresStore(cfg.Db.ConnectionString);
-await store.InitializeAsync(CancellationToken.None);
-
-var mux = await ConnectionMultiplexer.ConnectAsync(cfg.Redis.ConnectionString);
-var queue = new RedisQueue(mux);
-await queue.EnsureConsumerGroupAsync();
-
-var reappearDays = int.TryParse(Environment.GetEnvironmentVariable("REAPPEAR_DAYS"), out var rd) ? rd : 7;
-var reappearThreshold = TimeSpan.FromDays(reappearDays);
-
-using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("BroadcastifySpikes", "1.0"));
-
-while (true)
+internal static class Program
 {
-    var nowUtc = DateTimeOffset.UtcNow;
-
-    try
+    private static readonly HttpClient Http = new(new HttpClientHandler
     {
-        var html = await http.GetStringAsync(cfg.Ingest.TopUrl);
+        AutomaticDecompression = System.Net.DecompressionMethods.All
+    });
+
+    public static async Task Main(string[] args)
+    {
+        var cfg = AppConfig.FromEnvironment();
+
+        var topUrl =
+            Environment.GetEnvironmentVariable("TOP_FEEDS_URL")
+            ?? "https://m.broadcastify.com/listen/top";
+
+        var pollSeconds =
+            int.TryParse(Environment.GetEnvironmentVariable("INGEST_POLL_SECONDS"), out var ps) ? ps : 60;
+
+        // If a feed hasn't been seen in this long, treat it as "reappeared"
+        var reappearHours =
+            int.TryParse(Environment.GetEnvironmentVariable("FEED_REAPPEAR_HOURS"), out var rh) ? rh : 24;
+
+        Console.WriteLine($"[ingestor] topUrl={topUrl}");
+        Console.WriteLine($"[ingestor] pollSeconds={pollSeconds}");
+        Console.WriteLine($"[ingestor] reappearHours={reappearHours}");
+
+        var store = new PostgresStore(cfg.Db.ConnectionString);
+        await store.InitializeAsync(CancellationToken.None);
+
+        var mux = await ConnectionMultiplexer.ConnectAsync(cfg.Redis.ConnectionString);
+        var queue = new RedisQueue(mux);
+        await queue.EnsureConsumerGroupAsync();
+
+        while (true)
+        {
+            var nowUtc = DateTimeOffset.UtcNow;
+
+            try
+            {
+                var runId = Guid.NewGuid();
+
+                await InsertIngestRunStartAsync(cfg.Db.ConnectionString, runId, nowUtc, CancellationToken.None);
+
+                var html = await Http.GetStringAsync(topUrl);
+                var rows = ParseTopFeeds(html);
+
+                var pulledCount = 0;
+
+                foreach (var r in rows)
+                {
+                    pulledCount++;
+
+                    // Upsert feed metadata
+                    await store.UpsertFeedAsync(new FeedDefinition(r.FeedId, r.Name, r.Url), CancellationToken.None);
+
+                    // Determine new vs reappeared based on last seen
+                    var lastSeen = await store.GetLastSeenUtcAsync(r.FeedId, CancellationToken.None);
+                    var isNew = lastSeen is null;
+                    var isReappeared = lastSeen is not null &&
+                                       (nowUtc - lastSeen.Value) >= TimeSpan.FromHours(reappearHours);
+
+                    // Mark seen timestamps
+                    await store.SetSeenTimestampsAsync(
+                        r.FeedId,
+                        nowUtc,
+                        setFirstSeenIfNull: true,
+                        CancellationToken.None);
+
+                    // Insert sample
+                    await store.InsertSampleAsync(
+                        new FeedSample(r.FeedId, nowUtc, r.Listeners),
+                        CancellationToken.None);
+
+                    // Record this run's pulled rows
+                    await UpsertIngestRunItemAsync(cfg.Db.ConnectionString, runId, r.FeedId, nowUtc, r.Listeners, CancellationToken.None);
+
+                    // Emit feed_seen events (reason is a string, no enum dependency)
+                    if (isNew || isReappeared)
+                    {
+                        var reason = isNew ? "new" : "reappeared";
+
+                        // FeedSeenEvent must accept (feedId, name, url, tsUtc, reason)
+                        // If your FeedSeenEvent doesn't include reason, see note below.
+                        await queue.EnqueueAsync(
+                            EventTypes.FeedSeen,
+                            new FeedSeenEvent(r.FeedId, r.Name, r.Url, nowUtc, reason));
+                    }
+                }
+
+                await UpdateIngestRunCompleteAsync(cfg.Db.ConnectionString, runId, DateTimeOffset.UtcNow, pulledCount, CancellationToken.None);
+
+                Console.WriteLine($"[ingestor] pulled={pulledCount} at {nowUtc:O}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ingestor] error: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(pollSeconds));
+        }
+    }
+
+    private static List<ParsedFeedRow> ParseTopFeeds(string html)
+    {
         var doc = new HtmlDocument();
         doc.LoadHtml(html);
 
-        var links = doc.DocumentNode.SelectNodes("//a[contains(@href, '/feed/')]");
-        if (links is null || links.Count == 0)
-        {
-            Console.WriteLine("[ingestor] no /feed/ links found (page changed?)");
-            await Task.Delay(cfg.Ingest.PollInterval);
-            continue;
-        }
+        var trs = doc.DocumentNode.SelectNodes("//table//tbody/tr") ?? new HtmlNodeCollection(null);
 
-        var seenThisRun = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var stored = 0;
-        var emitted = 0;
+        var result = new List<ParsedFeedRow>(trs.Count);
 
-        foreach (var a in links)
+        foreach (var tr in trs)
         {
+            var a = tr.SelectSingleNode(".//a[contains(@href,'/listen/feed/')]");
+            if (a is null) continue;
+
             var href = a.GetAttributeValue("href", "").Trim();
-            if (string.IsNullOrWhiteSpace(href)) continue;
-
             var feedId = ExtractFeedId(href);
             if (string.IsNullOrWhiteSpace(feedId)) continue;
 
-            if (!seenThisRun.Add(feedId)) continue;
-
             var name = HtmlEntity.DeEntitize(a.InnerText).Trim();
-            if (string.IsNullOrWhiteSpace(name)) name = $"Feed {feedId}";
 
-            var url = href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-                ? href
-                : $"https://m.broadcastify.com{href}";
+            var badge = tr.SelectSingleNode(".//span[contains(@class,'badge')]");
+            var badgeText = badge is null
+                ? HtmlEntity.DeEntitize(tr.InnerText).Trim()
+                : HtmlEntity.DeEntitize(badge.InnerText).Trim();
 
-            var listeners = ExtractListenersFromRow(a);
+            var listeners = ExtractFirstInt(badgeText);
 
-            // Determine if this is "new to us" or "reappeared"
-            var existing = await store.GetFeedAsync(feedId, CancellationToken.None);
-            var lastSeen = existing is null ? null : await store.GetLastSeenUtcAsync(feedId, CancellationToken.None);
+            var url = $"https://m.broadcastify.com{href}";
 
-            var isNew = existing is null;
-            var isReappeared = !isNew && lastSeen is not null && (nowUtc - lastSeen.Value) >= reappearThreshold;
-
-            await store.UpsertFeedAsync(new FeedDefinition(feedId, name, url), CancellationToken.None);
-            await store.SetSeenTimestampsAsync(feedId, nowUtc, setFirstSeenIfNull: true, CancellationToken.None);
-            await store.InsertSampleAsync(new FeedSample(feedId, nowUtc, listeners), CancellationToken.None);
-
-            stored++;
-
-            if (isNew || isReappeared)
-            {
-                var reason = isNew ? "new" : "reappeared";
-                var evt = new FeedSeenEvent(feedId, name, url, nowUtc, reason);
-
-                await queue.EnqueueAsync(EventTypes.FeedSeen, evt);
-
-                emitted++;
-                Console.WriteLine($"[ingestor] FEED_SEEN ({reason}) {feedId} {name}");
-            }
+            result.Add(new ParsedFeedRow(feedId, name, url, listeners));
         }
 
-        Console.WriteLine($"[ingestor] stored {stored} samples, emitted {emitted} feed_seen events @ {nowUtc:O}");
+        return result;
     }
-    catch (Exception ex)
+
+    private static string ExtractFeedId(string href)
     {
-        Console.WriteLine($"[ingestor] error: {ex.Message}");
+        if (string.IsNullOrWhiteSpace(href)) return "";
+
+        var parts = href.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var i = parts.Length - 1; i >= 0; i--)
+        {
+            if (parts[i].All(char.IsDigit))
+                return parts[i];
+        }
+
+        return "";
     }
 
-    await Task.Delay(cfg.Ingest.PollInterval);
-}
+    private static int ExtractFirstInt(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return 0;
 
-static string? ExtractFeedId(string href)
-{
-    var idx = href.IndexOf("/feed/", StringComparison.OrdinalIgnoreCase);
-    if (idx < 0) return null;
+        var i = 0;
+        while (i < s.Length && !char.IsDigit(s[i])) i++;
+        if (i == s.Length) return 0;
 
-    var tail = href[(idx + "/feed/".Length)..];
-    var id = new string(tail.TakeWhile(char.IsDigit).ToArray());
-    return string.IsNullOrWhiteSpace(id) ? null : id;
-}
+        var j = i;
+        while (j < s.Length && char.IsDigit(s[j])) j++;
 
-static int ExtractListenersFromRow(HtmlNode a)
-{
-    var tr = a.Ancestors("tr").FirstOrDefault();
-    if (tr is null) return 0;
+        return int.TryParse(s.Substring(i, j - i), out var n) ? n : 0;
+    }
 
-    // status cell is the other <td> in the row; it contains something like:
-    // <span class="badge badge-success">141 Listeners</span>
-    var statusText = HtmlEntity.DeEntitize(tr.InnerText).Trim();
+    private static async Task InsertIngestRunStartAsync(string cs, Guid runId, DateTimeOffset startedAtUtc, CancellationToken token)
+    {
+        await using var conn = new NpgsqlConnection(cs);
+        await conn.OpenAsync(token);
 
-    // More targeted: look for the badge span first (less noisy than full row text)
-    var badge = tr.SelectSingleNode(".//span[contains(@class,'badge')]");
-    if (badge is not null)
-        statusText = HtmlEntity.DeEntitize(badge.InnerText).Trim();
+        const string sql = @"
+INSERT INTO ingest_runs(run_id, started_at_utc, completed_at_utc, pulled_count)
+VALUES (@rid, @started, NULL, 0);";
 
-    // Extract leading integer anywhere in the string (handles "141 Listeners")
-    var digits = new string(statusText.TakeWhile(c => !char.IsDigit(c)).ToArray());
-    // That line is wrong: we want the digits, not the prefix. We'll do proper scan instead.
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@rid", runId);
+        cmd.Parameters.AddWithValue("@started", startedAtUtc.UtcDateTime);
+        await cmd.ExecuteNonQueryAsync(token);
+    }
 
-    var numberStr = ExtractFirstInteger(statusText);
-    return int.TryParse(numberStr, out var n) ? n : 0;
-}
+    private static async Task UpsertIngestRunItemAsync(string cs, Guid runId, string feedId, DateTimeOffset tsUtc, int listeners, CancellationToken token)
+    {
+        await using var conn = new NpgsqlConnection(cs);
+        await conn.OpenAsync(token);
 
-static string ExtractFirstInteger(string s)
-{
-    // Finds the first contiguous run of digits anywhere in the string
-    var i = 0;
-    while (i < s.Length && !char.IsDigit(s[i])) i++;
-    if (i == s.Length) return "";
+        const string sql = @"
+INSERT INTO ingest_run_items(run_id, feed_id, ts_utc, listeners)
+VALUES (@rid, @fid, @ts, @l)
+ON CONFLICT (run_id, feed_id) DO UPDATE
+SET ts_utc = excluded.ts_utc,
+    listeners = excluded.listeners;";
 
-    var j = i;
-    while (j < s.Length && char.IsDigit(s[j])) j++;
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@rid", runId);
+        cmd.Parameters.AddWithValue("@fid", feedId);
+        cmd.Parameters.AddWithValue("@ts", tsUtc.UtcDateTime);
+        cmd.Parameters.AddWithValue("@l", listeners);
+        await cmd.ExecuteNonQueryAsync(token);
+    }
 
-    return s.Substring(i, j - i);
+    private static async Task UpdateIngestRunCompleteAsync(string cs, Guid runId, DateTimeOffset completedAtUtc, int pulledCount, CancellationToken token)
+    {
+        await using var conn = new NpgsqlConnection(cs);
+        await conn.OpenAsync(token);
+
+        const string sql = @"
+UPDATE ingest_runs
+SET completed_at_utc = @done,
+    pulled_count = @cnt
+WHERE run_id = @rid;";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@rid", runId);
+        cmd.Parameters.AddWithValue("@done", completedAtUtc.UtcDateTime);
+        cmd.Parameters.AddWithValue("@cnt", pulledCount);
+        await cmd.ExecuteNonQueryAsync(token);
+    }
+
+    private readonly record struct ParsedFeedRow(string FeedId, string Name, string Url, int Listeners);
 }

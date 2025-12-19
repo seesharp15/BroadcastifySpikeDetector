@@ -4,6 +4,10 @@
     <ProjectReference Include="..\BroadcastifySpikes.Core\BroadcastifySpikes.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="wwwroot\" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>

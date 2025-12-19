@@ -1,161 +1,240 @@
 using BroadcastifySpikes.Core;
 using Npgsql;
 
-var cfg = AppConfig.FromEnvironment();
-var store = new PostgresStore(cfg.Db.ConnectionString);
-await store.InitializeAsync(CancellationToken.None);
+var builder = WebApplication.CreateBuilder(args);
 
-var app = WebApplication.CreateBuilder(args).Build();
+builder.Services.AddRouting();
+builder.Services.AddEndpointsApiExplorer();
 
-app.MapGet("/", async () =>
+var app = builder.Build();
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
+// Prefer AppConfig (same pattern as other services). This should build from existing env vars like
+// POSTGRES_HOST / POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB (or whatever your AppConfig expects).
+string? cs = null;
+
+try
 {
-    // Super simple embedded HTML page that hits JSON endpoints
-    const string html = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Broadcastify Spikes</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    .row { display: flex; gap: 24px; }
-    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; width: 33%; }
-    pre { white-space: pre-wrap; word-break: break-word; }
-  </style>
-</head>
-<body>
-  <h2>Broadcastify Spikes Dashboard</h2>
-  <div class="row">
-    <div class="card">
-      <h3>Active spikes</h3>
-      <pre id="spikes">Loading...</pre>
-    </div>
-    <div class="card">
-      <h3>Recently seen feeds</h3>
-      <pre id="seen">Loading...</pre>
-    </div>
-    <div class="card">
-      <h3>Recent samples</h3>
-      <pre id="samples">Loading...</pre>
-    </div>
-  </div>
-
-<script>
-async function load() {
-  const [spikes, seen, samples] = await Promise.all([
-    fetch('/api/active-spikes').then(r => r.json()),
-    fetch('/api/recent-seen').then(r => r.json()),
-    fetch('/api/recent-samples').then(r => r.json()),
-  ]);
-  document.getElementById('spikes').textContent = JSON.stringify(spikes, null, 2);
-  document.getElementById('seen').textContent = JSON.stringify(seen, null, 2);
-  document.getElementById('samples').textContent = JSON.stringify(samples, null, 2);
+    var cfg = AppConfig.FromEnvironment();
+    cs = cfg.Db.ConnectionString;
 }
-load();
-setInterval(load, 5000);
-</script>
-</body>
-</html>
-""";
-    return Results.Text(html, "text/html");
-});
-
-// Active spikes = feeds where spike_state.is_active = true
-app.MapGet("/api/active-spikes", async () =>
+catch
 {
-    var cs = cfg.Db.ConnectionString;
+    // Swallow and fallback to explicit connection string env vars below.
+}
+
+// Fallback if AppConfig didn't provide a usable connection string
+cs ??= Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING")
+   ?? Environment.GetEnvironmentVariable("DB_CONNECTION_STRING");
+
+if (string.IsNullOrWhiteSpace(cs))
+{
+    throw new InvalidOperationException(
+        "Dashboard could not determine Postgres connection string. " +
+        "Either ensure AppConfig env vars are set (POSTGRES_HOST/USER/PASSWORD/DB etc.), " +
+        "or set POSTGRES_CONNECTION_STRING (or DB_CONNECTION_STRING).");
+}
+
+// Ensure dashboard-required tables exist (idempotent)
+await EnsureSchemaAsync(cs);
+
+app.MapGet("/api/health", () => Results.Ok(new { ok = true, utc = DateTimeOffset.UtcNow }));
+
+app.MapGet("/api/latest-run", async (int? limit) =>
+{
+    var take = Clamp(limit ?? 200, 1, 2000);
+
     await using var conn = new NpgsqlConnection(cs);
     await conn.OpenAsync();
 
-    const string sql = @"
-SELECT f.feed_id, f.name, f.url, s.activated_at_utc
-FROM spike_state s
-JOIN feeds f ON f.feed_id = s.feed_id
-WHERE s.is_active = true
-ORDER BY s.activated_at_utc DESC
-LIMIT 100;";
+    var runSql = @"
+SELECT run_id, started_at_utc, completed_at_utc, pulled_count
+FROM ingest_runs
+ORDER BY COALESCE(completed_at_utc, started_at_utc) DESC
+LIMIT 1;";
 
-    await using var cmd = new NpgsqlCommand(sql, conn);
-    await using var r = await cmd.ExecuteReaderAsync();
+    await using var runCmd = new NpgsqlCommand(runSql, conn);
+    await using var rr = await runCmd.ExecuteReaderAsync();
 
-    var list = new List<object>();
-    while (await r.ReadAsync())
+    if (!await rr.ReadAsync())
     {
-        list.Add(new
+        return Results.Ok(new { run = (object?)null, records = Array.Empty<object>() });
+    }
+
+    var runId = rr.GetGuid(0);
+    var started = rr.GetDateTime(1);
+    var completed = rr.IsDBNull(2) ? (DateTime?)null : rr.GetDateTime(2);
+    var pulledCount = rr.IsDBNull(3) ? 0 : rr.GetInt32(3);
+    await rr.CloseAsync();
+
+    var recSql = @"
+SELECT
+  i.ts_utc,
+  i.feed_id,
+  f.name,
+  f.url,
+  i.listeners
+FROM ingest_run_items i
+JOIN feeds f ON f.feed_id = i.feed_id
+WHERE i.run_id = @rid
+ORDER BY i.listeners DESC, i.ts_utc DESC
+LIMIT @lim;";
+
+    await using var recCmd = new NpgsqlCommand(recSql, conn);
+    recCmd.Parameters.AddWithValue("@rid", runId);
+    recCmd.Parameters.AddWithValue("@lim", take);
+
+    var records = new List<object>(take);
+    await using var r2 = await recCmd.ExecuteReaderAsync();
+    while (await r2.ReadAsync())
+    {
+        records.Add(new
         {
-            feedId = r.GetString(0),
-            name = r.GetString(1),
-            url = r.GetString(2),
-            activatedAtUtc = r.IsDBNull(3) ? null : r.GetDateTime(3).ToUniversalTime().ToString("O")
+            tsUtc = new DateTimeOffset(r2.GetDateTime(0), TimeSpan.Zero),
+            feedId = r2.GetString(1),
+            name = r2.GetString(2),
+            url = r2.GetString(3),
+            listeners = r2.GetInt32(4),
         });
     }
 
-    return Results.Json(list);
-});
-
-// Recently seen feeds based on last_seen_utc
-app.MapGet("/api/recent-seen", async () =>
-{
-    var cs = cfg.Db.ConnectionString;
-    await using var conn = new NpgsqlConnection(cs);
-    await conn.OpenAsync();
-
-    const string sql = @"
-SELECT feed_id, name, url, last_seen_utc, first_seen_utc
-FROM feeds
-WHERE last_seen_utc IS NOT NULL
-ORDER BY last_seen_utc DESC
-LIMIT 50;";
-
-    await using var cmd = new NpgsqlCommand(sql, conn);
-    await using var r = await cmd.ExecuteReaderAsync();
-
-    var list = new List<object>();
-    while (await r.ReadAsync())
+    return Results.Ok(new
     {
-        list.Add(new
+        run = new
         {
-            feedId = r.GetString(0),
-            name = r.GetString(1),
-            url = r.GetString(2),
-            lastSeenUtc = r.IsDBNull(3) ? null : r.GetDateTime(3).ToUniversalTime().ToString("O"),
-            firstSeenUtc = r.IsDBNull(4) ? null : r.GetDateTime(4).ToUniversalTime().ToString("O")
-        });
-    }
-
-    return Results.Json(list);
+            runId,
+            startedAtUtc = new DateTimeOffset(started, TimeSpan.Zero),
+            completedAtUtc = completed ?? new DateTimeOffset(completed.Value, TimeSpan.Zero),
+            pulledCount
+        },
+        records
+    });
 });
 
-// Recent samples (latest few across all feeds)
-app.MapGet("/api/recent-samples", async () =>
+app.MapGet("/api/samples", async (int? limit) =>
 {
-    var cs = cfg.Db.ConnectionString;
+    var take = Clamp(limit ?? 400, 1, 5000);
+
     await using var conn = new NpgsqlConnection(cs);
     await conn.OpenAsync();
 
-    const string sql = @"
-SELECT s.feed_id, f.name, s.ts_utc, s.listeners
+    var sql = @"
+SELECT
+  s.ts_utc,
+  s.feed_id,
+  f.name,
+  f.url,
+  s.listeners
 FROM samples s
 JOIN feeds f ON f.feed_id = s.feed_id
 ORDER BY s.ts_utc DESC
-LIMIT 50;";
+LIMIT @lim;";
 
     await using var cmd = new NpgsqlCommand(sql, conn);
-    await using var r = await cmd.ExecuteReaderAsync();
+    cmd.Parameters.AddWithValue("@lim", take);
 
-    var list = new List<object>();
+    var rows = new List<object>(take);
+    await using var r = await cmd.ExecuteReaderAsync();
     while (await r.ReadAsync())
     {
-        list.Add(new
+        rows.Add(new
         {
-            feedId = r.GetString(0),
-            name = r.GetString(1),
-            tsUtc = r.GetDateTime(2).ToUniversalTime().ToString("O"),
-            listeners = r.GetInt32(3)
+            tsUtc = new DateTimeOffset(r.GetDateTime(0), TimeSpan.Zero),
+            feedId = r.GetString(1),
+            name = r.GetString(2),
+            url = r.GetString(3),
+            listeners = r.GetInt32(4),
         });
     }
 
-    return Results.Json(list);
+    return Results.Ok(new { rows });
 });
 
-app.Run("http://0.0.0.0:8080");
+app.MapGet("/api/alerts", async (int? limit) =>
+{
+    var take = Clamp(limit ?? 300, 1, 5000);
+
+    await using var conn = new NpgsqlConnection(cs);
+    await conn.OpenAsync();
+
+    var sql = @"
+SELECT
+  a.ts_utc,
+  a.feed_id,
+  f.name,
+  f.url,
+  a.alert_type,
+  a.message
+FROM alert_history a
+JOIN feeds f ON f.feed_id = a.feed_id
+ORDER BY a.ts_utc DESC
+LIMIT @lim;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("@lim", take);
+
+    var rows = new List<object>(take);
+    await using var r = await cmd.ExecuteReaderAsync();
+    while (await r.ReadAsync())
+    {
+        rows.Add(new
+        {
+            tsUtc = new DateTimeOffset(r.GetDateTime(0), TimeSpan.Zero),
+            feedId = r.GetString(1),
+            name = r.GetString(2),
+            url = r.GetString(3),
+            alertType = r.GetString(4),
+            message = r.IsDBNull(5) ? "" : r.GetString(5),
+        });
+    }
+
+    return Results.Ok(new { rows });
+});
+
+app.Run();
+
+static int Clamp(int v, int min, int max)
+{
+    return v < min ? min : (v > max ? max : v);
+}
+
+static async Task EnsureSchemaAsync(string cs)
+{
+    await using var conn = new NpgsqlConnection(cs);
+    await conn.OpenAsync();
+
+    var sql = @"
+CREATE TABLE IF NOT EXISTS ingest_runs (
+  run_id UUID PRIMARY KEY,
+  started_at_utc TIMESTAMPTZ NOT NULL,
+  completed_at_utc TIMESTAMPTZ NULL,
+  pulled_count INT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS ingest_run_items (
+  run_id UUID NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
+  ts_utc TIMESTAMPTZ NOT NULL,
+  listeners INT NOT NULL,
+  PRIMARY KEY (run_id, feed_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_run_items_ts ON ingest_run_items(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_ingest_runs_completed ON ingest_runs(completed_at_utc);
+
+CREATE TABLE IF NOT EXISTS alert_history (
+  id BIGSERIAL PRIMARY KEY,
+  ts_utc TIMESTAMPTZ NOT NULL,
+  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
+  alert_type TEXT NOT NULL,
+  message TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_ts ON alert_history(ts_utc);
+";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    await cmd.ExecuteNonQueryAsync();
+}
