@@ -1,0 +1,114 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: broadcastify-postgres
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: broadcastify-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ingestor:
+    build:
+      context: ../src
+      dockerfile: BroadcastifySpikes.Ingestor/Dockerfile
+    container_name: broadcastify-ingestor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - SERVICE_NAME=ingestor
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    restart: unless-stopped
+
+  detector:
+    build:
+      context: ../src
+      dockerfile: BroadcastifySpikes.Detector/Dockerfile
+    container_name: broadcastify-detector
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - SERVICE_NAME=detector
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    restart: unless-stopped
+
+  alerter:
+    build:
+      context: ../src
+      dockerfile: BroadcastifySpikes.Alerter/Dockerfile
+    container_name: broadcastify-alerter
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - SERVICE_NAME=alerter
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+    restart: unless-stopped
+
+  cleanup:
+    build:
+      context: ../src
+      dockerfile: BroadcastifySpikes.Cleanup/Dockerfile
+    container_name: broadcastify-cleanup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - SERVICE_NAME=cleanup
+      - POSTGRES_HOST=postgres
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ../src
+      dockerfile: BroadcastifySpikes.Dashboard/Dockerfile
+    container_name: broadcastify-dashboard
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - SERVICE_NAME=dashboard
+      - POSTGRES_HOST=postgres
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+
+volumes:
+  pg_data:
+  redis_data:
