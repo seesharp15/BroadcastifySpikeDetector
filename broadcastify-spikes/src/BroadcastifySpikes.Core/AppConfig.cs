@@ -19,7 +19,12 @@ public sealed record DetectConfig(
     double RobustZThreshold,
     double RecoveryZThreshold,
     int MinSamples,
-    int PersistSamples);
+    int PersistSamples,
+    int NewFeedMinListeners,
+    double GlobalRobustZThreshold,
+    int GlobalMinSamples,
+    TimeSpan GlobalLookbackWindow,
+    TimeSpan MaxSampleAge);
 
 public sealed record AlertConfig(TimeSpan SuppressWindow);
 
@@ -68,6 +73,13 @@ public sealed record AppConfig(
         var minSamples = GetInt("MIN_SAMPLES", 40);
         var persist = GetInt("PERSIST_SAMPLES", 3);
 
+        var globalRobustZThreshold = GetDouble("GLOBAL_ROBUST_Z", 3.0);
+        var newFeedMinListeners = GetInt("GLOBAL_NEW_FEED_MIN_LISTENERS", 80);
+        var globalMinSamples = GetInt("GLOBAL_MIN_SAMPLES", 300);
+        var globalLookbackWindowDays = GetInt("GLOBAL_LOOKBACK_WINDOW_DAYS", 180);
+
+        var maxSampleAgeDays = GetInt("MAX_SAMPLE_AGE_DAYS", 3);
+
         var suppressHrs = GetInt("ALERT_SUPPRESS_HOURS", 8);
 
         return new AppConfig(
@@ -75,7 +87,7 @@ public sealed record AppConfig(
             Db: new DbConfig(pgHost, pgPort, pgDb, pgUser, pgPw),
             Redis: new RedisConfig(redisHost, redisPort),
             Ingest: new IngestConfig(new Uri("https://m.broadcastify.com/listen/top"), ingestPoll),
-            Detect: new DetectConfig(detectPoll, TimeSpan.FromDays(lookbackDays), robustZ, recoveryZ, minSamples, persist),
+            Detect: new DetectConfig(detectPoll, TimeSpan.FromDays(lookbackDays), robustZ, recoveryZ, minSamples, persist, newFeedMinListeners, globalRobustZThreshold, globalMinSamples, TimeSpan.FromDays(globalLookbackWindowDays), TimeSpan.FromDays(maxSampleAgeDays)),
             Alert: new AlertConfig(TimeSpan.FromHours(suppressHrs))
         );
     }

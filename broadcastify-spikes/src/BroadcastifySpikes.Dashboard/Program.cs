@@ -13,32 +13,11 @@ app.UseStaticFiles();
 
 // Prefer AppConfig (same pattern as other services). This should build from existing env vars like
 // POSTGRES_HOST / POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB (or whatever your AppConfig expects).
-string? cs = null;
 
-try
-{
-    var cfg = AppConfig.FromEnvironment();
-    cs = cfg.Db.ConnectionString;
-}
-catch
-{
-    // Swallow and fallback to explicit connection string env vars below.
-}
+var cfg = AppConfig.FromEnvironment();
 
-// Fallback if AppConfig didn't provide a usable connection string
-cs ??= Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING")
-   ?? Environment.GetEnvironmentVariable("DB_CONNECTION_STRING");
-
-if (string.IsNullOrWhiteSpace(cs))
-{
-    throw new InvalidOperationException(
-        "Dashboard could not determine Postgres connection string. " +
-        "Either ensure AppConfig env vars are set (POSTGRES_HOST/USER/PASSWORD/DB etc.), " +
-        "or set POSTGRES_CONNECTION_STRING (or DB_CONNECTION_STRING).");
-}
-
-// Ensure dashboard-required tables exist (idempotent)
-await EnsureSchemaAsync(cs);
+var store = new PostgresStore(cfg.Db.ConnectionString);
+await store.InitializeAsync(CancellationToken.None);
 
 app.MapGet("/api/health", () => Results.Ok(new { ok = true, utc = DateTimeOffset.UtcNow }));
 
@@ -46,7 +25,7 @@ app.MapGet("/api/latest-run", async (int? limit) =>
 {
     var take = Clamp(limit ?? 200, 1, 2000);
 
-    await using var conn = new NpgsqlConnection(cs);
+    await using var conn = new NpgsqlConnection(cfg.Db.ConnectionString);
     await conn.OpenAsync();
 
     var runSql = @"
@@ -75,7 +54,8 @@ SELECT
   i.feed_id,
   f.name,
   f.url,
-  i.listeners
+  i.listeners,
+  i.Rank
 FROM ingest_run_items i
 JOIN feeds f ON f.feed_id = i.feed_id
 WHERE i.run_id = @rid
@@ -97,6 +77,7 @@ LIMIT @lim;";
             name = r2.GetString(2),
             url = r2.GetString(3),
             listeners = r2.GetInt32(4),
+            rank = r2.GetInt32(5)
         });
     }
 
@@ -117,7 +98,7 @@ app.MapGet("/api/samples", async (int? limit) =>
 {
     var take = Clamp(limit ?? 400, 1, 5000);
 
-    await using var conn = new NpgsqlConnection(cs);
+    await using var conn = new NpgsqlConnection(cfg.Db.ConnectionString);
     await conn.OpenAsync();
 
     var sql = @"
@@ -126,7 +107,8 @@ SELECT
   s.feed_id,
   f.name,
   f.url,
-  s.listeners
+  s.listeners,
+  coalesce(s.rank, -1) as ""rank""
 FROM samples s
 JOIN feeds f ON f.feed_id = s.feed_id
 ORDER BY s.ts_utc DESC
@@ -146,6 +128,7 @@ LIMIT @lim;";
             name = r.GetString(2),
             url = r.GetString(3),
             listeners = r.GetInt32(4),
+            rank = r.GetInt32(5),
         });
     }
 
@@ -156,7 +139,7 @@ app.MapGet("/api/alerts", async (int? limit) =>
 {
     var take = Clamp(limit ?? 300, 1, 5000);
 
-    await using var conn = new NpgsqlConnection(cs);
+    await using var conn = new NpgsqlConnection(cfg.Db.ConnectionString);
     await conn.OpenAsync();
 
     var sql = @"
@@ -198,43 +181,4 @@ app.Run();
 static int Clamp(int v, int min, int max)
 {
     return v < min ? min : (v > max ? max : v);
-}
-
-static async Task EnsureSchemaAsync(string cs)
-{
-    await using var conn = new NpgsqlConnection(cs);
-    await conn.OpenAsync();
-
-    var sql = @"
-CREATE TABLE IF NOT EXISTS ingest_runs (
-  run_id UUID PRIMARY KEY,
-  started_at_utc TIMESTAMPTZ NOT NULL,
-  completed_at_utc TIMESTAMPTZ NULL,
-  pulled_count INT NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS ingest_run_items (
-  run_id UUID NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
-  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
-  ts_utc TIMESTAMPTZ NOT NULL,
-  listeners INT NOT NULL,
-  PRIMARY KEY (run_id, feed_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_ingest_run_items_ts ON ingest_run_items(ts_utc);
-CREATE INDEX IF NOT EXISTS idx_ingest_runs_completed ON ingest_runs(completed_at_utc);
-
-CREATE TABLE IF NOT EXISTS alert_history (
-  id BIGSERIAL PRIMARY KEY,
-  ts_utc TIMESTAMPTZ NOT NULL,
-  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
-  alert_type TEXT NOT NULL,
-  message TEXT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_alert_history_ts ON alert_history(ts_utc);
-";
-
-    await using var cmd = new NpgsqlCommand(sql, conn);
-    await cmd.ExecuteNonQueryAsync();
 }

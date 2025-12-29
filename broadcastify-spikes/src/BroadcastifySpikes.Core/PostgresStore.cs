@@ -43,9 +43,45 @@ CREATE TABLE IF NOT EXISTS alert_state (
   last_alert_utc TIMESTAMPTZ NULL
 );
 
+CREATE TABLE IF NOT EXISTS ingest_runs (
+  run_id UUID PRIMARY KEY,
+  started_at_utc TIMESTAMPTZ NOT NULL,
+  completed_at_utc TIMESTAMPTZ NULL,
+  pulled_count INT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS ingest_run_items (
+  run_id UUID NOT NULL REFERENCES ingest_runs(run_id) ON DELETE CASCADE,
+  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
+  ts_utc TIMESTAMPTZ NOT NULL,
+  listeners INT NOT NULL,
+  PRIMARY KEY (run_id, feed_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_run_items_ts ON ingest_run_items(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_ingest_runs_completed ON ingest_runs(completed_at_utc);
+
+CREATE TABLE IF NOT EXISTS alert_history (
+  id BIGSERIAL PRIMARY KEY,
+  ts_utc TIMESTAMPTZ NOT NULL,
+  feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
+  alert_type TEXT NOT NULL,
+  message TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_ts ON alert_history(ts_utc);
+
 -- Safe schema evolution for discovery/reappearance logic
 ALTER TABLE feeds ADD COLUMN IF NOT EXISTS first_seen_utc TIMESTAMPTZ NULL;
 ALTER TABLE feeds ADD COLUMN IF NOT EXISTS last_seen_utc  TIMESTAMPTZ NULL;
+
+-- Safe schema evolution for global baseline using rank buckets (Top 25 position)
+ALTER TABLE samples ADD COLUMN IF NOT EXISTS ""rank"" INT NULL;
+ALTER TABLE ingest_run_items ADD COLUMN IF NOT EXISTS ""rank"" INT;
+
+
+CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts_utc);
+CREATE INDEX IF NOT EXISTS idx_samples_rank_ts ON samples(""rank"", ts_utc);
 ";
         await using var cmd = new NpgsqlCommand(sql, conn);
         await cmd.ExecuteNonQueryAsync(token);
@@ -71,11 +107,13 @@ ON CONFLICT(feed_id) DO UPDATE SET name=excluded.name, url=excluded.url;";
         await using var conn = new NpgsqlConnection(this._cs);
         await conn.OpenAsync(token);
 
-        var sql = @"INSERT INTO samples(feed_id, ts_utc, listeners) VALUES (@id, @ts, @l);";
+        // rank is nullable; store NULL if missing
+        var sql = @"INSERT INTO samples(feed_id, ts_utc, listeners, ""rank"") VALUES (@id, @ts, @l, @rank);";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@id", sample.FeedId);
         cmd.Parameters.AddWithValue("@ts", sample.TimestampUtc.UtcDateTime);
         cmd.Parameters.AddWithValue("@l", sample.ListenerCount);
+        cmd.Parameters.AddWithValue("@rank", (object?)sample.Rank ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync(token);
     }
 
@@ -154,8 +192,9 @@ ON CONFLICT(feed_id) DO UPDATE SET name=excluded.name, url=excluded.url;";
         await using var conn = new NpgsqlConnection(this._cs);
         await conn.OpenAsync(token);
 
+        // rank is nullable
         var sql = @"
-SELECT feed_id, ts_utc, listeners
+SELECT feed_id, ts_utc, listeners, ""rank""
 FROM samples
 WHERE feed_id=@id AND ts_utc >= @from
 ORDER BY ts_utc ASC;";
@@ -166,10 +205,45 @@ ORDER BY ts_utc ASC;";
         await using var reader = await cmd.ExecuteReaderAsync(token);
         while (await reader.ReadAsync(token))
         {
+            var rank = reader.IsDBNull(3) ? (int?)null : reader.GetInt32(3);
+
             list.Add(new FeedSample(
                 reader.GetString(0),
                 new DateTimeOffset(reader.GetDateTime(1), TimeSpan.Zero),
-                reader.GetInt32(2)));
+                reader.GetInt32(2),
+                rank));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// Fetch listener counts for samples whose rank is within [minRank..maxRank] over a time window.
+    /// Use this for rank-bucketed global baselines (compute median/MAD in C#).
+    /// </summary>
+    public async Task<List<int>> GetListenerCountsForRankRangeAsync(int minRankInclusive, int maxRankInclusive, DateTimeOffset fromUtc, CancellationToken token)
+    {
+        var list = new List<int>();
+
+        await using var conn = new NpgsqlConnection(this._cs);
+        await conn.OpenAsync(token);
+
+        var sql = @"
+SELECT listeners
+FROM samples
+WHERE ts_utc >= @from
+  AND ""rank"" IS NOT NULL
+  AND ""rank"" >= @minRank
+  AND ""rank"" <= @maxRank;";
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@from", fromUtc.UtcDateTime);
+        cmd.Parameters.AddWithValue("@minRank", minRankInclusive);
+        cmd.Parameters.AddWithValue("@maxRank", maxRankInclusive);
+
+        await using var reader = await cmd.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            list.Add(reader.GetInt32(0));
         }
 
         return list;
@@ -254,4 +328,39 @@ ON CONFLICT(feed_id) DO UPDATE SET last_alert_utc=excluded.last_alert_utc;";
         var rows = await cmd.ExecuteNonQueryAsync(token);
         return rows;
     }
+
+    public async Task<List<GlobalRankSample>> GetGlobalRankSamplesAsync(
+    DateTimeOffset fromUtc,
+    CancellationToken token)
+    {
+        await using var conn = new NpgsqlConnection(this._cs);
+        await conn.OpenAsync(token);
+
+        // Minimal DB logic: just return the raw fields needed.
+        // NOTE: "rank" is best quoted because it's a keyword-ish identifier in SQL contexts.
+        const string sql = @"
+SELECT
+  ""rank"",
+  listeners::double precision AS listeners
+FROM samples
+WHERE ts_utc >= @from
+  AND ""rank"" IS NOT NULL;
+";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@from", fromUtc.UtcDateTime);
+
+        var rows = new List<GlobalRankSample>();
+
+        await using var reader = await cmd.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            rows.Add(new GlobalRankSample(
+                reader.GetInt32(0),
+                reader.GetDouble(1)));
+        }
+
+        return rows;
+    }
+
 }

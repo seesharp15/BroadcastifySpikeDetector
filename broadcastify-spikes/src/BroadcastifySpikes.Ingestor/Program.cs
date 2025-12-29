@@ -73,13 +73,13 @@ internal static class Program
                         setFirstSeenIfNull: true,
                         CancellationToken.None);
 
-                    // Insert sample
+                    // Insert sample (rank included)
                     await store.InsertSampleAsync(
-                        new FeedSample(r.FeedId, nowUtc, r.Listeners),
+                        new FeedSample(r.FeedId, nowUtc, r.Listeners, r.Rank),
                         CancellationToken.None);
 
                     // Record this run's pulled rows
-                    await UpsertIngestRunItemAsync(cfg.Db.ConnectionString, runId, r.FeedId, nowUtc, r.Listeners, CancellationToken.None);
+                    await UpsertIngestRunItemAsync(cfg.Db.ConnectionString, runId, r.FeedId, nowUtc, r.Listeners, r.Rank, CancellationToken.None);
 
                     // Emit feed_seen events (reason is a string, no enum dependency)
                     if (isNew || isReappeared)
@@ -87,7 +87,6 @@ internal static class Program
                         var reason = isNew ? "new" : "reappeared";
 
                         // FeedSeenEvent must accept (feedId, name, url, tsUtc, reason)
-                        // If your FeedSeenEvent doesn't include reason, see note below.
                         await queue.EnqueueAsync(
                             EventTypes.FeedSeen,
                             new FeedSeenEvent(r.FeedId, r.Name, r.Url, nowUtc, reason));
@@ -113,8 +112,9 @@ internal static class Program
         doc.LoadHtml(html);
 
         var trs = doc.DocumentNode.SelectNodes("//table//tbody/tr") ?? new HtmlNodeCollection(null);
-
         var result = new List<ParsedFeedRow>(trs.Count);
+
+        var rank = 0;
 
         foreach (var tr in trs)
         {
@@ -126,17 +126,23 @@ internal static class Program
             if (string.IsNullOrWhiteSpace(feedId)) continue;
 
             var name = HtmlEntity.DeEntitize(a.InnerText).Trim();
-
-            var badge = tr.SelectSingleNode(".//span[contains(@class,'badge')]");
-            var badgeText = badge is null
-                ? HtmlEntity.DeEntitize(tr.InnerText).Trim()
-                : HtmlEntity.DeEntitize(badge.InnerText).Trim();
-
-            var listeners = ExtractFirstInt(badgeText);
-
             var url = $"https://m.broadcastify.com{href}";
 
-            result.Add(new ParsedFeedRow(feedId, name, url, listeners));
+            // increment rank only for valid feed rows
+            rank++;
+
+            // Parse listeners ONLY from the "Status" column to avoid capturing
+            // other numbers like "(100 minutes ago)" from alert blocks.
+            var statusTd = tr.SelectSingleNode("./td[last()]");
+            var badge = statusTd?.SelectSingleNode(".//span[contains(@class,'badge')]");
+
+            var statusText = badge is not null
+                ? HtmlEntity.DeEntitize(badge.InnerText).Trim() // e.g. "141 Listeners"
+                : HtmlEntity.DeEntitize(statusTd?.InnerText ?? "").Trim();
+
+            var listeners = ExtractFirstInt(statusText);
+
+            result.Add(new ParsedFeedRow(feedId, name, url, listeners, rank));
         }
 
         return result;
@@ -185,23 +191,25 @@ VALUES (@rid, @started, NULL, 0);";
         await cmd.ExecuteNonQueryAsync(token);
     }
 
-    private static async Task UpsertIngestRunItemAsync(string cs, Guid runId, string feedId, DateTimeOffset tsUtc, int listeners, CancellationToken token)
+    private static async Task UpsertIngestRunItemAsync(string cs, Guid runId, string feedId, DateTimeOffset tsUtc, int listeners, int rank, CancellationToken token)
     {
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync(token);
 
         const string sql = @"
-INSERT INTO ingest_run_items(run_id, feed_id, ts_utc, listeners)
-VALUES (@rid, @fid, @ts, @l)
+INSERT INTO ingest_run_items(run_id, feed_id, ts_utc, listeners, rank)
+VALUES (@rid, @fid, @ts, @l, @r)
 ON CONFLICT (run_id, feed_id) DO UPDATE
 SET ts_utc = excluded.ts_utc,
-    listeners = excluded.listeners;";
+    listeners = excluded.listeners,
+    rank = excluded.rank;";
 
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@rid", runId);
         cmd.Parameters.AddWithValue("@fid", feedId);
         cmd.Parameters.AddWithValue("@ts", tsUtc.UtcDateTime);
         cmd.Parameters.AddWithValue("@l", listeners);
+        cmd.Parameters.AddWithValue("@r", rank);
         await cmd.ExecuteNonQueryAsync(token);
     }
 
@@ -223,5 +231,5 @@ WHERE run_id = @rid;";
         await cmd.ExecuteNonQueryAsync(token);
     }
 
-    private readonly record struct ParsedFeedRow(string FeedId, string Name, string Url, int Listeners);
+    private readonly record struct ParsedFeedRow(string FeedId, string Name, string Url, int Listeners, int Rank);
 }

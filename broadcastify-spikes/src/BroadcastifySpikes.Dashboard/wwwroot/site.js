@@ -55,7 +55,8 @@ function rowRun(r) {
   <td>${fmtUtc(r.tsUtc)}</td>
   <td>${safeText(r.name)}</td>
   <td>${safeText(r.feedId)}</td>
-  <td class="right">${r.listeners}</td>
+  <td>${r.listeners}</td>
+  <td>${r.rank}</td>
   <td><a class="link" href="${r.url}" target="_blank" rel="noreferrer">open</a></td>
 </tr>`;
 }
@@ -66,7 +67,8 @@ function rowSample(r) {
   <td>${fmtUtc(r.tsUtc)}</td>
   <td>${safeText(r.name)}</td>
   <td>${safeText(r.feedId)}</td>
-  <td class="right">${r.listeners}</td>
+  <td>${r.listeners}</td>
+  <td>${r.rank}</td>
   <td><a class="link" href="${r.url}" target="_blank" rel="noreferrer">open</a></td>
 </tr>`;
 }
@@ -118,7 +120,7 @@ async function refreshAll() {
 
   // samples
   try {
-    const res = await fetch("/api/samples?limit=750");
+    const res = await fetch("/api/samples?limit=10000");
     const data = await res.json();
     const rows = data.rows ?? [];
 
