@@ -191,3 +191,125 @@ a.link:hover{text-decoration:underline}
   padding:18px;
   color:var(--muted);
 }
+
+/* Split panel: tables on left, inspector on right */
+.panel-split {
+    display: flex;
+    gap: 14px;
+    align-items: stretch;
+}
+
+.panel-left {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.panel-right {
+    width: 520px;
+    flex: 0 0 520px;
+    border-left: 1px solid var(--border);
+    padding: 10px 12px 12px 0;
+}
+
+@media (max-width: 1100px) {
+    .panel-split {
+        flex-direction: column;
+    }
+
+    .panel-right {
+        width: auto;
+        flex: 1 1 auto;
+        border-left: none;
+        padding: 0 10px 10px 10px;
+    }
+}
+
+.inspector-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px;
+}
+
+.inspector-title {
+    font-size: 14px;
+    font-weight: 900;
+}
+
+.inspector-subtitle {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+}
+
+.btn-muted {
+    opacity: 0.85;
+}
+
+.inspector-section {
+    padding: 0 10px 10px 10px;
+}
+
+.inspector-section-title {
+    font-weight: 900;
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: .2px;
+    margin: 12px 0 8px 0;
+}
+
+.inspector-kv {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.kv {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 10px;
+    background: rgba(255,255,255,.03);
+}
+
+.kv-label {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.kv-value {
+    margin-top: 6px;
+    font-weight: 900;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.stat {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 10px;
+    background: rgba(255,255,255,.03);
+}
+
+.stat-label {
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.stat-value {
+    margin-top: 6px;
+    font-weight: 900;
+    font-size: 18px;
+}
+
+.grid tbody tr.selected {
+    background: rgba(110,168,254,.12);
+}
