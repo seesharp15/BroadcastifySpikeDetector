@@ -59,7 +59,7 @@ body{
 .chip-bad{border-color:rgba(239,68,68,.35); color:#ffd0d0}
 .chip-muted{color:var(--muted)}
 
-.wrap{max-width:1200px; margin:0 auto; padding:18px}
+.wrap{max-width:1800px; margin:0 auto; padding:18px}
 .cards{
   display:grid;
   grid-template-columns: repeat(3, minmax(0,1fr));
@@ -134,13 +134,19 @@ body{
 }
 
 .tabbody{display:none; padding:10px}
-.tabbody.active{display:block}
-
-.tablewrap{
-  max-height: 62vh;
-  overflow:auto;
-  border:1px solid var(--border);
-  border-radius:14px;
+.tabbody.active {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 70vh;
+}
+.tablewrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 14px;
 }
 
 .grid{
@@ -167,6 +173,13 @@ body{
   background: rgba(255,255,255,.03);
 }
 .right{text-align:right}
+
+/* Prevent UTC timestamp wrapping in the first column */
+.grid th:first-child,
+.grid td:first-child {
+    white-space: nowrap;
+    min-width: 170px; /* matches your inline header width */
+}
 
 a.link{
   color: var(--accent);
@@ -197,11 +210,15 @@ a.link:hover{text-decoration:underline}
     display: flex;
     gap: 14px;
     align-items: stretch;
+    min-height: 0; /* critical for nested flex scrolling */
 }
 
 .panel-left {
+    display: flex;
+    flex-direction: column;
     flex: 1 1 auto;
     min-width: 0;
+    min-height: 0;
 }
 
 .panel-right {

@@ -108,8 +108,7 @@ services:
       - "8080:8080"
     restart: unless-stopped
     volumes:
-      - ../dashboard-assets/wwwroot:/app/wwwroot:ro
-
+      - ../src/BroadcastifySpikes.Dashboard/wwwroot:/app/wwwroot:ro
 
 volumes:
   pg_data:
